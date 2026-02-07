@@ -1039,6 +1039,8 @@
     <string name="category_all">All</string>
 
     <string name="import_local_archive">Import local archive</string>
+    <string name="restore_download_items">Restore download items</string>
+    <string name="restore_download_items_message">Restoring download items, please wait…</string>
     <string name="import_archive_title">Select archive file</string>
     <string name="import_archive_failed">Failed to import archive</string>
     <string name="archive_permission_lost">Permission to access archive has been lost. Please re-import the archive file.</string>

@@ -951,6 +951,8 @@
     <string name="category_all">全部</string>
 
     <string name="import_local_archive">导入本地压缩包</string>
+    <string name="restore_download_items">恢复下载项</string>
+    <string name="restore_download_items_message">正在恢复下载项,请稍候…</string>
     <string name="import_archive_title">选择压缩包文件</string>
     <string name="import_archive_failed">压缩包导入失败</string>
     <string name="archive_permission_lost">访问压缩包的权限已丢失，请重新导入压缩包文件。</string>

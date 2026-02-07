@@ -191,4 +191,9 @@
         android:title="@string/import_local_archive"
         app:showAsAction="never"/>
 
+    <item
+        android:id="@+id/restore_download_items"
+        android:title="@string/restore_download_items"
+        app:showAsAction="never"/>
+
 </menu>

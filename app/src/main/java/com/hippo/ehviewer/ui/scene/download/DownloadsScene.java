@@ -92,6 +92,7 @@ import com.hippo.ehviewer.download.DownloadManager;
 import com.hippo.ehviewer.download.DownloadService;
 import com.hippo.ehviewer.event.SomethingNeedRefresh;
 import com.hippo.ehviewer.spider.SpiderInfo;
+import com.hippo.ehviewer.spider.SpiderQueen;
 import com.hippo.ehviewer.sync.DownloadListInfosExecutor;
 import com.hippo.ehviewer.sync.DownloadSpiderInfoExecutor;
 import com.hippo.ehviewer.ui.GalleryActivity;
@@ -121,6 +122,7 @@ import org.greenrobot.eventbus.EventBus;
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -129,6 +131,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+
+import okhttp3.OkHttpClient;
 
 public class DownloadsScene extends ToolbarScene
         implements DownloadManager.DownloadInfoListener, DownloadSearchCallback,
@@ -827,6 +831,9 @@ public class DownloadsScene extends ToolbarScene
                 return true;
             case R.id.import_local_archive:
                 importLocalArchive();
+                return true;
+            case R.id.restore_download_items:
+                restoreDownloadItems();
                 return true;
 //            case R.id.misc:
 //            case R.id.doujinshi:
@@ -2011,4 +2018,164 @@ public class DownloadsScene extends ToolbarScene
         updateView();
         queryUnreadSpiderInfo();
     }
+
+    /**
+     * 恢复下载项 - 从下载目录扫描并恢复丢失的下载记录
+     */
+    private void restoreDownloadItems() {
+        Context context = getEHContext();
+        if (context == null || mDownloadManager == null) {
+            return;
+        }
+
+        // 显示进度对话框
+        android.app.ProgressDialog progressDialog = new android.app.ProgressDialog(context);
+        progressDialog.setTitle(R.string.restore_download_items);
+        progressDialog.setMessage(getString(R.string.restore_download_items_message));
+        progressDialog.setIndeterminate(false);
+        progressDialog.setProgressStyle(android.app.ProgressDialog.STYLE_HORIZONTAL);
+        progressDialog.setCancelable(false);
+        progressDialog.show();
+
+        // 在后台线程执行恢复任务
+        new AsyncTask<Void, Object, Integer>() {
+            @Override
+            protected Integer doInBackground(Void... params) {
+                UniFile dir = Settings.getDownloadLocation();
+                if (dir == null) {
+                    return -1;
+                }
+
+                List<RestoreItem> restoreItemList = new ArrayList<>();
+                UniFile[] files = dir.listFiles();
+                if (files == null) {
+                    return -1;
+                }
+
+                int total = files.length;
+                publishProgress(0, total, 0); // 当前进度, 总数, 状态(0=扫描)
+
+                // 扫描所有文件夹
+                for (int i = 0; i < total; i++) {
+                    UniFile file = files[i];
+                    if (file != null && file.isDirectory()) {
+                        UniFile siFile = file.findFile(SpiderQueen.SPIDER_INFO_FILENAME);
+                        if (siFile != null) {
+                            InputStream is = null;
+                            try {
+                                is = siFile.openInputStream();
+                                SpiderInfo spiderInfo = SpiderInfo.read(is);
+                                if (spiderInfo != null) {
+                                    long gid = spiderInfo.gid;
+                                    if (!mDownloadManager.containDownloadInfo(gid)) {
+                                        RestoreItem item = new RestoreItem();
+                                        item.gid = gid;
+                                        item.token = spiderInfo.token;
+                                        item.dirname = file.getName();
+                                        restoreItemList.add(item);
+                                    }
+                                }
+                            } catch (IOException e) {
+                                Log.e(TAG, "Failed to read spider info for " + file.getName(), e);
+                            } finally {
+                                com.hippo.lib.yorozuya.IOUtils.closeQuietly(is);
+                            }
+                        }
+                    }
+                    publishProgress(i + 1, total, 0);
+                }
+
+                if (restoreItemList.isEmpty()) {
+                    return 0; // 没有需要恢复的项
+                }
+
+                publishProgress(-1, -1, 1); // 状态=1(获取画廊信息)
+
+                // 调用 API 获取画廊详情
+                try {
+                    OkHttpClient httpClient = EhApplication.getOkHttpClient(context);
+                    List<GalleryInfo> result = com.hippo.ehviewer.client.EhEngine.fillGalleryListByApi(
+                            null,
+                            httpClient,
+                            new ArrayList<GalleryInfo>(restoreItemList),
+                            com.hippo.ehviewer.client.EhUrl.getReferer()
+                    );
+
+                    if (result != null) {
+                        int count = 0;
+                        for (int i = 0; i < result.size(); i++) {
+                            GalleryInfo item = result.get(i);
+                            if (item instanceof RestoreItem && item.title != null) {
+                                RestoreItem restoreItem = (RestoreItem) item;
+                                // 添加到下载管理器
+                                mDownloadManager.addDownload(item, null);
+                                // 保存目录映射到数据库
+                                EhDB.putDownloadDirname(item.gid, restoreItem.dirname);
+                                count++;
+                            }
+                        }
+                        return count;
+                    }
+                } catch (Throwable e) {
+                    Log.e(TAG, "Failed to restore download items", e);
+                    Analytics.recordException(e);
+                }
+
+                return -2; // API 调用失败
+            }
+
+            @Override
+            protected void onProgressUpdate(Object... values) {
+                if (!progressDialog.isShowing()) {
+                    return;
+                }
+
+                int progress = (Integer) values[0];
+                int max = (Integer) values[1];
+                int status = (Integer) values[2];
+
+                if (progress == -1 && max == -1) {
+                    // 切换到获取画廊信息状态
+                    progressDialog.setIndeterminate(true);
+                    progressDialog.setMessage(getString(R.string.settings_download_restore_download_items_get_gallery_info));
+                } else {
+                    // 扫描文件夹状态
+                    progressDialog.setIndeterminate(false);
+                    progressDialog.setMax(max);
+                    progressDialog.setProgress(progress);
+                }
+            }
+
+            @Override
+            protected void onPostExecute(Integer result) {
+                if (progressDialog.isShowing()) {
+                    progressDialog.dismiss();
+                }
+
+                if (context == null) {
+                    return;
+                }
+
+                if (result == null || result == -1) {
+                    Toast.makeText(context, R.string.settings_download_restore_failed, Toast.LENGTH_SHORT).show();
+                } else if (result == 0) {
+                    Toast.makeText(context, R.string.settings_download_restore_not_found, Toast.LENGTH_SHORT).show();
+                } else if (result == -2) {
+                    Toast.makeText(context, R.string.settings_download_restore_failed, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(context,
+                            getString(R.string.settings_download_restore_successfully, result),
+                            Toast.LENGTH_SHORT).show();
+                }
+            }
+        }.execute();
+    }
+
+    /**
+     * 恢复项数据类
+     */
+    private static class RestoreItem extends GalleryInfo {
+        public String dirname;
+    }
+
 }
