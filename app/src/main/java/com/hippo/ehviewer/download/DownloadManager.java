@@ -89,9 +89,18 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
     private DownloadListener mDownloadListener;
     private final List<DownloadInfoListener> mDownloadInfoListeners;
 
+    // 多任务并发下载支持
+    private final Map<Long, DownloadInfo> mCurrentTasks = new HashMap<>();
+    private final Map<Long, SpiderQueen> mCurrentSpiders = new HashMap<>();
+    private final Map<Long, SpiderListenerWrapper> mListenerWrappers = new HashMap<>(); // GID到Listener的映射
+    private final Map<SpiderQueen, Long> mSpiderToGidMap = new HashMap<>(); // Spider反向查找GID
+
+    // 保留旧的单任务变量用于兼容性（已废弃）
     @Nullable
+    @Deprecated
     private DownloadInfo mCurrentTask;
     @Nullable
+    @Deprecated
     private SpiderQueen mCurrentSpider;
 
     private final ConcurrentPool<NotifyTask> mNotifyTaskPool = new ConcurrentPool<>(5);
@@ -311,27 +320,49 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
     }
 
     private void ensureDownload() {
-        if (mCurrentTask != null) {
-            // Only one download
+        // 获取并发下载数量设置
+        int maxConcurrent = Settings.getConcurrentGalleryDownload();
+
+        Log.d(TAG, "ensureDownload: maxConcurrent=" + maxConcurrent + ", current=" + mCurrentTasks.size() + ", waiting=" + mWaitList.size());
+
+        // 检查当前正在下载的任务数
+        if (mCurrentTasks.size() >= maxConcurrent) {
+            // 已达到最大并发数
+            Log.d(TAG, "ensureDownload: Already at max concurrent limit");
             return;
         }
 
-        // Get download from wait list
-        if (!mWaitList.isEmpty()) {
+        // 从等待列表中获取下载任务，直到达到最大并发数
+        while (mCurrentTasks.size() < maxConcurrent && !mWaitList.isEmpty()) {
             DownloadInfo info = mWaitList.removeFirst();
 
             // 检查下载信息有效性
             if (info == null || info.gid <= 0) {
                 Log.w(TAG, "Invalid download info, skipping");
-                ensureDownload(); // 尝试下一个
-                return;
+                continue; // 跳过并尝试下一个
             }
+
+            Log.d(TAG, "ensureDownload: Starting new download gid=" + info.gid + ", title=" + info.title);
 
             try {
                 SpiderQueen spider = SpiderQueen.obtainSpiderQueen(mContext, info, SpiderQueen.MODE_DOWNLOAD);
-                mCurrentTask = info;
-                mCurrentSpider = spider;
-                spider.addOnSpiderListener(this);
+
+                // 为每个 Spider 创建独立的 Listener 包装器
+                SpiderListenerWrapper listenerWrapper = new SpiderListenerWrapper(info.gid, this);
+
+                // 添加到当前任务映射
+                mCurrentTasks.put(info.gid, info);
+                mCurrentSpiders.put(info.gid, spider);
+                mListenerWrappers.put(info.gid, listenerWrapper);
+                mSpiderToGidMap.put(spider, info.gid); // 添加反向映射
+
+                // 兼容旧代码 - 保持第一个任务在旧变量中
+                if (mCurrentTask == null) {
+                    mCurrentTask = info;
+                    mCurrentSpider = spider;
+                }
+
+                spider.addOnSpiderListener(listenerWrapper);
                 info.state = DownloadInfo.STATE_DOWNLOAD;
                 info.speed = -1;
                 info.remaining = -1;
@@ -354,21 +385,24 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                         l.onUpdate(info, list, mWaitList);
                     }
                 }
+
+                Log.d(TAG, "Started download: gid=" + info.gid + ", current tasks=" + mCurrentTasks.size());
             } catch (Exception e) {
                 Log.e(TAG, "Failed to start download for gid: " + info.gid, e);
                 Analytics.recordException(e);
-                // 标记为失败并继续下一个
+                // 标记为失败
                 info.state = DownloadInfo.STATE_FAILED;
                 EhDB.putDownloadInfo(info);
-                mCurrentTask = null;
-                mCurrentSpider = null;
-                ensureDownload(); // 尝试下一个
+                // 不需要清理映射，因为这个任务从未被添加
             }
         }
+
+        Log.d(TAG, "ensureDownload: After loop, current tasks=" + mCurrentTasks.size());
     }
 
     void startDownload(GalleryInfo galleryInfo, @Nullable String label) {
-        if (mCurrentTask != null && mCurrentTask.gid == galleryInfo.gid) {
+        // 检查是否已在当前下载任务中
+        if (mCurrentTasks.containsKey(galleryInfo.gid)) {
             // It is current task
             return;
         }
@@ -718,8 +752,11 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
         }
         mWaitList.clear();
 
-        // Stop current
-        stopCurrentDownloadInternal();
+        // Stop all current tasks
+        List<Long> gidsToStop = new ArrayList<>(mCurrentTasks.keySet());
+        for (Long gid : gidsToStop) {
+            stopCurrentDownloadInternal(gid);
+        }
 
         // Notify mDownloadInfoListener
         for (DownloadInfoListener l : mDownloadInfoListeners) {
@@ -837,10 +874,10 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
     // Update listener
     // No ensureDownload
     private DownloadInfo stopDownloadInternal(long gid) {
-        // Check current task
-        if (mCurrentTask != null && mCurrentTask.gid == gid) {
-            // Stop current
-            return stopCurrentDownloadInternal();
+        // Check current tasks
+        if (mCurrentTasks.containsKey(gid)) {
+            // Stop current task
+            return stopCurrentDownloadInternal(gid);
         }
 
         for (Iterator<DownloadInfo> iterator = mWaitList.iterator(); iterator.hasNext(); ) {
@@ -860,20 +897,39 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
 
     // Update in DB
     // Update mDownloadListener
-    private DownloadInfo stopCurrentDownloadInternal() {
-        DownloadInfo info = mCurrentTask;
-        SpiderQueen spider = mCurrentSpider;
-        // Release spider
-        if (spider != null) {
-            spider.removeOnSpiderListener(DownloadManager.this);
-            SpiderQueen.releaseSpiderQueen(spider, SpiderQueen.MODE_DOWNLOAD);
-        }
-        mCurrentTask = null;
-        mCurrentSpider = null;
-        // Stop speed reminder
-        mSpeedReminder.stop();
+    // 停止指定GID的当前下载任务
+    private DownloadInfo stopCurrentDownloadInternal(long gid) {
+        DownloadInfo info = mCurrentTasks.get(gid);
+        SpiderQueen spider = mCurrentSpiders.get(gid);
+        SpiderListenerWrapper wrapper = mListenerWrappers.get(gid);
+
         if (info == null) {
             return null;
+        }
+
+        // Release spider
+        if (spider != null) {
+            if (wrapper != null) {
+                spider.removeOnSpiderListener(wrapper);
+            }
+            SpiderQueen.releaseSpiderQueen(spider, SpiderQueen.MODE_DOWNLOAD);
+            mSpiderToGidMap.remove(spider); // 清理反向映射
+        }
+
+        // 从当前任务映射中移除
+        mCurrentTasks.remove(gid);
+        mCurrentSpiders.remove(gid);
+        mListenerWrappers.remove(gid);
+
+        // 更新兼容性变量
+        if (mCurrentTask != null && mCurrentTask.gid == gid) {
+            mCurrentTask = null;
+            mCurrentSpider = null;
+        }
+
+        // 如果所有任务都停止了，停止速度提醒
+        if (mCurrentTasks.isEmpty()) {
+            mSpeedReminder.stop();
         }
 
         // Update state
@@ -887,6 +943,21 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
         return info;
     }
 
+    // 停止所有当前下载任务（保留用于stopAllDownload）
+    @Deprecated
+    private DownloadInfo stopCurrentDownloadInternal() {
+        // 停止第一个任务（兼容旧代码）
+        if (mCurrentTask != null) {
+            return stopCurrentDownloadInternal(mCurrentTask.gid);
+        }
+        // 如果没有旧的任务，停止第一个新任务
+        if (!mCurrentTasks.isEmpty()) {
+            long firstGid = mCurrentTasks.keySet().iterator().next();
+            return stopCurrentDownloadInternal(firstGid);
+        }
+        return null;
+    }
+
     // Update in DB
     // Update mDownloadListener
     private void stopRangeDownloadInternal(LongList gidList) {
@@ -896,10 +967,13 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                 stopDownloadInternal(gidList.get(i));
             }
         } else {
-            // Check current task
-            if (mCurrentTask != null && gidList.contains(mCurrentTask.gid)) {
-                // Stop current
-                stopCurrentDownloadInternal();
+            // Check current tasks
+            for (int i = 0, n = gidList.size(); i < n; i++) {
+                long gid = gidList.get(i);
+                if (mCurrentTasks.containsKey(gid)) {
+                    // Stop current task
+                    stopCurrentDownloadInternal(gid);
+                }
             }
 
             // Check all in wait list
@@ -1064,7 +1138,7 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
     }
 
     boolean isIdle() {
-        return mCurrentTask == null && mWaitList.isEmpty();
+        return mCurrentTasks.isEmpty() && mWaitList.isEmpty();
     }
 
     @Override
@@ -1271,21 +1345,41 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                     mSpeedReminder.onFinish();
                     // Download done
                     DownloadInfo info = mCurrentTask;
-                    mCurrentTask = null;
                     SpiderQueen spider = mCurrentSpider;
-                    mCurrentSpider = null;
-                    // Release spider
-                    if (spider != null) {
-                        spider.removeOnSpiderListener(DownloadManager.this);
-                        SpiderQueen.releaseSpiderQueen(spider, SpiderQueen.MODE_DOWNLOAD);
-                    }
+
                     // Check null
                     if (info == null || spider == null) {
                         Log.e(TAG, "Current stuff is null, but it should not be");
                         break;
                     }
-                    // Stop speed count
-                    mSpeedReminder.stop();
+
+                    long gid = info.gid;
+
+                    // Release spider and remove listener wrapper
+                    SpiderListenerWrapper wrapper = mListenerWrappers.get(gid);
+                    if (wrapper != null) {
+                        spider.removeOnSpiderListener(wrapper);
+                    }
+                    SpiderQueen.releaseSpiderQueen(spider, SpiderQueen.MODE_DOWNLOAD);
+
+                    // 从映射中移除
+                    mCurrentTasks.remove(gid);
+                    mCurrentSpiders.remove(gid);
+                    mListenerWrappers.remove(gid);
+                    mSpiderToGidMap.remove(spider);
+
+                    // 更新兼容性变量 - 如果还有其他任务,设置为第一个任务
+                    if (!mCurrentTasks.isEmpty()) {
+                        Long firstGid = mCurrentTasks.keySet().iterator().next();
+                        mCurrentTask = mCurrentTasks.get(firstGid);
+                        mCurrentSpider = mCurrentSpiders.get(firstGid);
+                    } else {
+                        mCurrentTask = null;
+                        mCurrentSpider = null;
+                        // 所有任务都完成,停止速度计数
+                        mSpeedReminder.stop();
+                    }
+
                     // Update state
                     info.finished = mFinished;
                     info.downloaded = mDownloaded;
@@ -1320,7 +1414,10 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                             l.onUpdate(info, list, mWaitList);
                         }
                     }
-                    // Start next download
+
+                    Log.d(TAG, "Download finished: gid=" + gid + ", remaining tasks=" + mCurrentTasks.size());
+
+                    // Start next download - 这会启动等待队列中的任务
                     ensureDownload();
                     break;
                 }
@@ -1341,6 +1438,13 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
 
         private final SparseIJArray mContentLengthMap = new SparseIJArray();
         private final SparseIJArray mReceivedSizeMap = new SparseIJArray();
+
+        // 为每个任务单独追踪字节数和速度
+        private final Map<Long, Long> mTaskBytesRead = new HashMap<>();
+        private final Map<Long, Long> mTaskOldSpeed = new HashMap<>();
+        private final Map<Long, long[]> mTaskSpeedSamples = new HashMap<>();
+        private final Map<Long, Integer> mTaskSpeedSampleIndex = new HashMap<>();
+        private final Map<Long, Integer> mTaskSpeedSampleCount = new HashMap<>();
 
         // 使用移动平均来平滑速度计算
         private static final int SPEED_SAMPLE_SIZE = 5;
@@ -1367,6 +1471,11 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                 mReceivedSizeMap.clear();
                 mSpeedSampleIndex = 0;
                 mSpeedSampleCount = 0;
+                mTaskBytesRead.clear();
+                mTaskOldSpeed.clear();
+                mTaskSpeedSamples.clear();
+                mTaskSpeedSampleIndex.clear();
+                mTaskSpeedSampleCount.clear();
                 SimpleHandler.getInstance().removeCallbacks(this);
             }
         }
@@ -1375,6 +1484,13 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
             mContentLengthMap.put(index, contentLength);
             mReceivedSizeMap.put(index, receivedSize);
             mBytesRead += bytesRead;
+
+            // 为当前任务累加字节数
+            if (mCurrentTask != null) {
+                long gid = mCurrentTask.gid;
+                long taskBytes = mTaskBytesRead.getOrDefault(gid, 0L);
+                mTaskBytesRead.put(gid, taskBytes + bytesRead);
+            }
         }
 
         public void onDone(int index) {
@@ -1389,40 +1505,60 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
 
         @Override
         public void run() {
-            DownloadInfo info = mCurrentTask;
-            if (info != null) {
-                // 计算实际时间间隔
-                long currentTime = System.currentTimeMillis();
-                long timeElapsed = currentTime - mLastUpdateTime;
-                if (timeElapsed <= 0) {
-                    timeElapsed = 2000; // 默认2秒
-                }
-                mLastUpdateTime = currentTime;
+            long currentTime = System.currentTimeMillis();
+            long timeElapsed = currentTime - mLastUpdateTime;
+            if (timeElapsed <= 0) {
+                timeElapsed = 2000; // 默认2秒
+            }
+            mLastUpdateTime = currentTime;
+
+            // 为每个正在下载的任务计算速度
+            for (Map.Entry<Long, DownloadInfo> entry : mCurrentTasks.entrySet()) {
+                long gid = entry.getKey();
+                DownloadInfo info = entry.getValue();
+
+                // 获取这个任务的字节数
+                long taskBytes = mTaskBytesRead.getOrDefault(gid, 0L);
 
                 // 计算当前速度 (字节/秒)
-                long currentSpeed = (mBytesRead * 1000L) / timeElapsed;
+                long currentSpeed = (taskBytes * 1000L) / timeElapsed;
+
+                // 初始化速度样本数组
+                if (!mTaskSpeedSamples.containsKey(gid)) {
+                    mTaskSpeedSamples.put(gid, new long[SPEED_SAMPLE_SIZE]);
+                    mTaskSpeedSampleIndex.put(gid, 0);
+                    mTaskSpeedSampleCount.put(gid, 0);
+                }
 
                 // 使用移动平均平滑速度
-                mSpeedSamples[mSpeedSampleIndex] = currentSpeed;
-                mSpeedSampleIndex = (mSpeedSampleIndex + 1) % SPEED_SAMPLE_SIZE;
-                if (mSpeedSampleCount < SPEED_SAMPLE_SIZE) {
-                    mSpeedSampleCount++;
+                long[] speedSamples = mTaskSpeedSamples.get(gid);
+                int sampleIndex = mTaskSpeedSampleIndex.get(gid);
+                int sampleCount = mTaskSpeedSampleCount.get(gid);
+
+                speedSamples[sampleIndex] = currentSpeed;
+                sampleIndex = (sampleIndex + 1) % SPEED_SAMPLE_SIZE;
+                if (sampleCount < SPEED_SAMPLE_SIZE) {
+                    sampleCount++;
                 }
+
+                mTaskSpeedSampleIndex.put(gid, sampleIndex);
+                mTaskSpeedSampleCount.put(gid, sampleCount);
 
                 long speedSum = 0;
-                for (int i = 0; i < mSpeedSampleCount; i++) {
-                    speedSum += mSpeedSamples[i];
+                for (int i = 0; i < sampleCount; i++) {
+                    speedSum += speedSamples[i];
                 }
-                long avgSpeed = speedSum / mSpeedSampleCount;
+                long avgSpeed = speedSum / sampleCount;
 
                 // 使用平滑算法
+                long taskOldSpeed = mTaskOldSpeed.getOrDefault(gid, -1L);
                 long newSpeed;
-                if (oldSpeed == -1) {
+                if (taskOldSpeed == -1) {
                     newSpeed = avgSpeed;
                 } else {
-                    newSpeed = (long) MathUtils.lerp(oldSpeed, avgSpeed, 0.6f);
+                    newSpeed = (long) MathUtils.lerp(taskOldSpeed, avgSpeed, 0.6f);
                 }
-                oldSpeed = newSpeed;
+                mTaskOldSpeed.put(gid, newSpeed);
                 info.speed = Math.max(0, newSpeed);
 
                 // 计算剩余时间 - 改进算法
@@ -1470,6 +1606,9 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                         l.onUpdate(info, list, mWaitList);
                     }
                 }
+
+                // 重置这个任务的字节计数
+                mTaskBytesRead.put(gid, 0L);
             }
 
             mBytesRead = 0;
@@ -1477,6 +1616,101 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
             if (!mStop) {
                 SimpleHandler.getInstance().postDelayed(this, 2000);
             }
+        }
+    }
+
+    /**
+     * Spider Listener 包装器 - 用于区分不同任务的回调
+     * 每个 Spider 有独立的 Listener 实例,记住对应的 GID
+     */
+    private class SpiderListenerWrapper implements SpiderQueen.OnSpiderListener {
+        private final long mGid;
+        private final DownloadManager mManager;
+
+        public SpiderListenerWrapper(long gid, DownloadManager manager) {
+            this.mGid = gid;
+            this.mManager = manager;
+        }
+
+        @Override
+        public void onGetPages(int pages) {
+            // 确保使用正确的任务
+            DownloadInfo info = mCurrentTasks.get(mGid);
+            if (info != null) {
+                // 临时设置为 mCurrentTask 以兼容现有代码
+                DownloadInfo oldTask = mCurrentTask;
+                mCurrentTask = info;
+                mManager.onGetPages(pages);
+                mCurrentTask = oldTask;
+            }
+        }
+
+        @Override
+        public void onGet509(int index) {
+            mManager.onGet509(index);
+        }
+
+        @Override
+        public void onPageDownload(int index, long contentLength, long receivedSize, int bytesRead) {
+            // 确保使用正确的任务
+            DownloadInfo info = mCurrentTasks.get(mGid);
+            if (info != null) {
+                DownloadInfo oldTask = mCurrentTask;
+                mCurrentTask = info;
+                mManager.onPageDownload(index, contentLength, receivedSize, bytesRead);
+                mCurrentTask = oldTask;
+            }
+        }
+
+        @Override
+        public void onPageSuccess(int index, int finished, int downloaded, int total) {
+            // 确保使用正确的任务
+            DownloadInfo info = mCurrentTasks.get(mGid);
+            if (info != null) {
+                DownloadInfo oldTask = mCurrentTask;
+                mCurrentTask = info;
+                mManager.onPageSuccess(index, finished, downloaded, total);
+                mCurrentTask = oldTask;
+            }
+        }
+
+        @Override
+        public void onPageFailure(int index, String error, int finished, int downloaded, int total) {
+            // 确保使用正确的任务
+            DownloadInfo info = mCurrentTasks.get(mGid);
+            if (info != null) {
+                DownloadInfo oldTask = mCurrentTask;
+                mCurrentTask = info;
+                mManager.onPageFailure(index, error, finished, downloaded, total);
+                mCurrentTask = oldTask;
+            }
+        }
+
+        @Override
+        public void onFinish(int finished, int downloaded, int total) {
+            // 确保使用正确的任务
+            DownloadInfo info = mCurrentTasks.get(mGid);
+            if (info != null) {
+                DownloadInfo oldTask = mCurrentTask;
+                SpiderQueen oldSpider = mCurrentSpider;
+                mCurrentTask = info;
+                mCurrentSpider = mCurrentSpiders.get(mGid);
+                mManager.onFinish(finished, downloaded, total);
+                mCurrentTask = oldTask;
+                mCurrentSpider = oldSpider;
+            }
+        }
+
+        @Override
+        public void onGetImageSuccess(int index, Image image) {
+            // 直接委托给 DownloadManager,这个回调通常被忽略
+            mManager.onGetImageSuccess(index, image);
+        }
+
+        @Override
+        public void onGetImageFailure(int index, String error) {
+            // 直接委托给 DownloadManager,这个回调通常被忽略
+            mManager.onGetImageFailure(index, error);
         }
     }
 

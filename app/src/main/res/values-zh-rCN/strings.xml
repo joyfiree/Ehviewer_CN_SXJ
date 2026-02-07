@@ -577,6 +577,8 @@
     <string name="settings_download_continue">继续</string>
     <string name="settings_download_multi_thread_download">下载线程数</string>
     <string name="settings_download_multi_thread_download_summary">最多同时下载 %s 张图片</string>
+    <string name="settings_download_concurrent_gallery">并发画廊数</string>
+    <string name="settings_download_concurrent_gallery_summary">最多同时下载 %s 个画廊</string>
     <string name="settings_download_preload_image">预载图片</string>
     <string name="settings_download_preload_image_summary">向后预载 %s 张图片</string>
     <string name="settings_download_image_resolution">图片分辨率</string>

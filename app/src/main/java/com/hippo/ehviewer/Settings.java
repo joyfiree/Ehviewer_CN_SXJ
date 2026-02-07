@@ -778,6 +778,17 @@ public class Settings {
         putIntToStr(KEY_MULTI_THREAD_DOWNLOAD, value);
     }
 
+    private static final String KEY_CONCURRENT_GALLERY_DOWNLOAD = "concurrent_gallery_download";
+    private static final int DEFAULT_CONCURRENT_GALLERY_DOWNLOAD = 2;
+
+    public static int getConcurrentGalleryDownload() {
+        return getIntFromStr(KEY_CONCURRENT_GALLERY_DOWNLOAD, DEFAULT_CONCURRENT_GALLERY_DOWNLOAD);
+    }
+
+    public static void putConcurrentGalleryDownload(int value) {
+        putIntToStr(KEY_CONCURRENT_GALLERY_DOWNLOAD, value);
+    }
+
     private static final String KEY_PRELOAD_IMAGE = "preload_image";
     private static final int DEFAULT_PRELOAD_IMAGE = 5;
 

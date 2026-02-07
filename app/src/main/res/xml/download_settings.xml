@@ -41,6 +41,16 @@
         app:entryValues="@array/multi_thread_download_entry_values"
         app:iconSpaceReserved="false" />
 
+    <!-- 并发画廊数设置 -->
+    <com.hippo.preference.ListPreference
+        android:defaultValue="2"
+        android:key="concurrent_gallery_download"
+        android:summary="@string/settings_download_concurrent_gallery_summary"
+        android:title="@string/settings_download_concurrent_gallery"
+        app:entries="@array/concurrent_gallery_entries"
+        app:entryValues="@array/concurrent_gallery_entry_values"
+        app:iconSpaceReserved="false" />
+
     <com.hippo.preference.ListPreference
         android:defaultValue="5"
         android:key="preload_image"

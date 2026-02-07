@@ -109,7 +109,7 @@ public final class SpiderQueen implements Runnable {
     public static final String SPIDER_INFO_BACKUP_DIR = "backupDir";
     private static final String TAG = SpiderQueen.class.getSimpleName();
     private static final AtomicInteger sIdGenerator = new AtomicInteger();
-    private static final boolean DEBUG_LOG = false;
+    private static final boolean DEBUG_LOG = true;
     private static final boolean DEBUG_PTOKEN = true;
     private static final String[] URL_509_SUFFIX_ARRAY = {
             "/509.gif",

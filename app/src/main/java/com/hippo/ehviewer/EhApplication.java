@@ -95,6 +95,7 @@ import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Cache;
 import okhttp3.ConnectionSpec;
+import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 import okhttp3.Response;
 
@@ -375,8 +376,11 @@ public class EhApplication extends RecordingApplication {
     public static OkHttpClient getOkHttpClient(@NonNull Context context) {
         EhApplication application = ((EhApplication) context.getApplicationContext());
         if (application.mOkHttpClient == null) {
-//            Dispatcher dispatcher = new Dispatcher();
-//            dispatcher.setMaxRequestsPerHost(4);
+            // 配置 Dispatcher 以支持并发画廊下载
+            // 每个画廊默认使用3个线程下载，如果并发2个画廊，需要至少6个连接
+            // 设置为20以留有余量
+            Dispatcher dispatcher = new Dispatcher();
+            dispatcher.setMaxRequestsPerHost(20);
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
                     .followRedirects(true)
                     .followSslRedirects(true)
@@ -387,7 +391,7 @@ public class EhApplication extends RecordingApplication {
                     .cookieJar(getEhCookieStore(application))
                     .cache(getOkHttpCache(application))
 //                    .hostnameVerifier((hostname, session) -> true)
-//                    .dispatcher(dispatcher)
+                    .dispatcher(dispatcher)
                     .dns(new EhHosts(application))
                     .addNetworkInterceptor(sprocket -> {
                         try {
@@ -458,6 +462,10 @@ public class EhApplication extends RecordingApplication {
     public static OkHttpClient getImageOkHttpClient(@NonNull Context context) {
         EhApplication application = ((EhApplication) context.getApplicationContext());
         if (application.mImageOkHttpClient == null) {
+            // 配置 Dispatcher 以支持并发画廊下载
+            // 图片下载是最关键的，需要支持多个画廊同时下载图片
+            Dispatcher dispatcher = new Dispatcher();
+            dispatcher.setMaxRequestsPerHost(20);
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
                     .followRedirects(false)
                     .followSslRedirects(false)
@@ -468,6 +476,7 @@ public class EhApplication extends RecordingApplication {
                     .cookieJar(getEhCookieStore(application))
                     .cache(getOkHttpCache(application))
 //                    .hostnameVerifier((hostname, session) -> true)
+                    .dispatcher(dispatcher)
                     .dns(new EhHosts(application))
                     .addNetworkInterceptor(sprocket -> {
                         try {
