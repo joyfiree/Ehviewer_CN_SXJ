@@ -319,31 +319,50 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
         // Get download from wait list
         if (!mWaitList.isEmpty()) {
             DownloadInfo info = mWaitList.removeFirst();
-            SpiderQueen spider = SpiderQueen.obtainSpiderQueen(mContext, info, SpiderQueen.MODE_DOWNLOAD);
-            mCurrentTask = info;
-            mCurrentSpider = spider;
-            spider.addOnSpiderListener(this);
-            info.state = DownloadInfo.STATE_DOWNLOAD;
-            info.speed = -1;
-            info.remaining = -1;
-            info.total = -1;
-            info.finished = 0;
-            info.downloaded = 0;
-            info.legacy = -1;
-            // Update in DB
-            EhDB.putDownloadInfo(info);
-            // Start speed count
-            mSpeedReminder.start();
-            // Notify start downloading
-            if (mDownloadListener != null) {
-                mDownloadListener.onStart(info);
+
+            // 检查下载信息有效性
+            if (info == null || info.gid <= 0) {
+                Log.w(TAG, "Invalid download info, skipping");
+                ensureDownload(); // 尝试下一个
+                return;
             }
-            // Notify state update
-            List<DownloadInfo> list = getInfoListForLabel(info.label);
-            if (list != null) {
-                for (DownloadInfoListener l : mDownloadInfoListeners) {
-                    l.onUpdate(info, list, mWaitList);
+
+            try {
+                SpiderQueen spider = SpiderQueen.obtainSpiderQueen(mContext, info, SpiderQueen.MODE_DOWNLOAD);
+                mCurrentTask = info;
+                mCurrentSpider = spider;
+                spider.addOnSpiderListener(this);
+                info.state = DownloadInfo.STATE_DOWNLOAD;
+                info.speed = -1;
+                info.remaining = -1;
+                info.total = -1;
+                info.finished = 0;
+                info.downloaded = 0;
+                info.legacy = -1;
+                // Update in DB
+                EhDB.putDownloadInfo(info);
+                // Start speed count
+                mSpeedReminder.start();
+                // Notify start downloading
+                if (mDownloadListener != null) {
+                    mDownloadListener.onStart(info);
                 }
+                // Notify state update
+                List<DownloadInfo> list = getInfoListForLabel(info.label);
+                if (list != null) {
+                    for (DownloadInfoListener l : mDownloadInfoListeners) {
+                        l.onUpdate(info, list, mWaitList);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to start download for gid: " + info.gid, e);
+                Analytics.recordException(e);
+                // 标记为失败并继续下一个
+                info.state = DownloadInfo.STATE_FAILED;
+                EhDB.putDownloadInfo(info);
+                mCurrentTask = null;
+                mCurrentSpider = null;
+                ensureDownload(); // 尝试下一个
             }
         }
     }
@@ -1272,11 +1291,23 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                     info.downloaded = mDownloaded;
                     info.total = mTotal;
                     info.legacy = mTotal - mFinished;
-                    if (info.legacy == 0) {
+
+                    // 改进的完成状态判断
+                    if (info.legacy == 0 && mFinished == mTotal && mTotal > 0) {
+                        // 完全成功
                         info.state = DownloadInfo.STATE_FINISH;
+                    } else if (mFinished > 0 && info.legacy < mTotal / 2) {
+                        // 大部分成功，仍标记为完成但记录部分失败
+                        info.state = DownloadInfo.STATE_FINISH;
+                        Log.w(TAG, String.format("Download finished with some failures: %d/%d pages, %d failed",
+                                mFinished, mTotal, info.legacy));
                     } else {
+                        // 失败或大部分失败
                         info.state = DownloadInfo.STATE_FAILED;
+                        Log.e(TAG, String.format("Download failed: %d/%d pages, %d failed",
+                                mFinished, mTotal, info.legacy));
                     }
+
                     // Update in DB
                     EhDB.putDownloadInfo(info);
                     // Notify
@@ -1306,13 +1337,23 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
 
         private long mBytesRead;
         private long oldSpeed = -1;
+        private long mLastUpdateTime = 0;
 
         private final SparseIJArray mContentLengthMap = new SparseIJArray();
         private final SparseIJArray mReceivedSizeMap = new SparseIJArray();
 
+        // 使用移动平均来平滑速度计算
+        private static final int SPEED_SAMPLE_SIZE = 5;
+        private final long[] mSpeedSamples = new long[SPEED_SAMPLE_SIZE];
+        private int mSpeedSampleIndex = 0;
+        private int mSpeedSampleCount = 0;
+
         public void start() {
             if (mStop) {
                 mStop = false;
+                mLastUpdateTime = System.currentTimeMillis();
+                mSpeedSampleIndex = 0;
+                mSpeedSampleCount = 0;
                 SimpleHandler.getInstance().post(this);
             }
         }
@@ -1324,6 +1365,8 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
                 oldSpeed = -1;
                 mContentLengthMap.clear();
                 mReceivedSizeMap.clear();
+                mSpeedSampleIndex = 0;
+                mSpeedSampleCount = 0;
                 SimpleHandler.getInstance().removeCallbacks(this);
             }
         }
@@ -1348,34 +1391,76 @@ public class DownloadManager implements SpiderQueen.OnSpiderListener {
         public void run() {
             DownloadInfo info = mCurrentTask;
             if (info != null) {
-                long newSpeed = mBytesRead / 2;
-                if (oldSpeed != -1) {
-                    newSpeed = (long) MathUtils.lerp(oldSpeed, newSpeed, 0.75f);
+                // 计算实际时间间隔
+                long currentTime = System.currentTimeMillis();
+                long timeElapsed = currentTime - mLastUpdateTime;
+                if (timeElapsed <= 0) {
+                    timeElapsed = 2000; // 默认2秒
+                }
+                mLastUpdateTime = currentTime;
+
+                // 计算当前速度 (字节/秒)
+                long currentSpeed = (mBytesRead * 1000L) / timeElapsed;
+
+                // 使用移动平均平滑速度
+                mSpeedSamples[mSpeedSampleIndex] = currentSpeed;
+                mSpeedSampleIndex = (mSpeedSampleIndex + 1) % SPEED_SAMPLE_SIZE;
+                if (mSpeedSampleCount < SPEED_SAMPLE_SIZE) {
+                    mSpeedSampleCount++;
+                }
+
+                long speedSum = 0;
+                for (int i = 0; i < mSpeedSampleCount; i++) {
+                    speedSum += mSpeedSamples[i];
+                }
+                long avgSpeed = speedSum / mSpeedSampleCount;
+
+                // 使用平滑算法
+                long newSpeed;
+                if (oldSpeed == -1) {
+                    newSpeed = avgSpeed;
+                } else {
+                    newSpeed = (long) MathUtils.lerp(oldSpeed, avgSpeed, 0.6f);
                 }
                 oldSpeed = newSpeed;
-                info.speed = newSpeed;
+                info.speed = Math.max(0, newSpeed);
 
-                // Calculate remaining
-                if (info.total <= 0) {
+                // 计算剩余时间 - 改进算法
+                if (info.total <= 0 || info.downloaded < 0) {
                     info.remaining = -1;
-                } else if (newSpeed == 0) {
+                } else if (newSpeed <= 0) {
                     info.remaining = 300L * 24L * 60L * 60L * 1000L; // 300 days
                 } else {
                     int downloadingCount = 0;
                     long downloadingContentLengthSum = 0;
-                    long totalSize = 0;
+                    long remainingBytes = 0;
+
+                    // 计算当前正在下载的文件的剩余大小
                     for (int i = 0, n = Math.max(mContentLengthMap.size(), mReceivedSizeMap.size()); i < n; i++) {
                         long contentLength = mContentLengthMap.valueAt(i);
                         long receivedSize = mReceivedSizeMap.valueAt(i);
-                        downloadingCount++;
-                        downloadingContentLengthSum += contentLength;
-                        totalSize += contentLength - receivedSize;
+                        if (contentLength > 0) {
+                            downloadingCount++;
+                            downloadingContentLengthSum += contentLength;
+                            remainingBytes += Math.max(0, contentLength - receivedSize);
+                        }
                     }
-                    if (downloadingCount != 0) {
-                        totalSize += downloadingContentLengthSum * (info.total - info.downloaded - downloadingCount) / downloadingCount;
-                        info.remaining = totalSize / newSpeed * 1000;
+
+                    // 估算未下载文件的大小
+                    int remainingFiles = info.total - info.downloaded - downloadingCount;
+                    if (downloadingCount > 0 && remainingFiles > 0) {
+                        long avgFileSize = downloadingContentLengthSum / downloadingCount;
+                        remainingBytes += avgFileSize * remainingFiles;
+                    }
+
+                    // 计算剩余时间(毫秒)
+                    if (remainingBytes > 0 && newSpeed > 0) {
+                        info.remaining = (remainingBytes * 1000L) / newSpeed;
+                    } else {
+                        info.remaining = -1;
                     }
                 }
+
                 if (mDownloadListener != null) {
                     mDownloadListener.onDownload(info);
                 }

@@ -30,6 +30,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.IntDef
 import androidx.core.app.NotificationCompat
+import com.hippo.ehviewer.Analytics
 import com.hippo.ehviewer.EhApplication
 import com.hippo.ehviewer.R
 import com.hippo.ehviewer.client.EhUtils
@@ -101,10 +102,14 @@ class DownloadService : Service(), DownloadManager.DownloadListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
             if (intent != null) {
-                // Handle the case where the intent is not null
                 handleIntent(intent)
+            } else {
+                Log.w("DownloadService", "Received null intent, checking if should stop")
+                checkStopSelf()
             }
-        } catch (_: NullPointerException) {
+        } catch (e: Exception) {
+            Log.e("DownloadService", "Error handling intent", e)
+            Analytics.recordException(e)
         }
         return START_STICKY
     }
@@ -309,21 +314,34 @@ class DownloadService : Service(), DownloadManager.DownloadListener {
         if (speed < 0) {
             speed = 0
         }
-        var text = FileUtils.humanReadableByteCount(speed, false) + "/S"
+        val speedText = FileUtils.humanReadableByteCount(speed, false) + "/S"
         val remaining = info.remaining
-        text = if (remaining >= 0) {
+        val text = if (remaining >= 0 && remaining < 86400000L) { // 少于1天
             getString(
                 R.string.download_speed_text_2,
-                text,
+                speedText,
                 ReadableTime.getShortTimeInterval(remaining)
             )
         } else {
-            getString(R.string.download_speed_text, text)
+            getString(R.string.download_speed_text, speedText)
         }
+
+        // 计算进度百分比用于通知栏显示
+        val progress = if (info.total > 0 && info.finished >= 0) {
+            ((info.finished.toFloat() / info.total.toFloat()) * 100).toInt()
+        } else {
+            0
+        }
+
         mDownloadingBuilder!!.setContentTitle(EhUtils.getSuitableTitle(info))
             .setContentText(text)
-            .setContentInfo(if (info.total == -1 || info.finished == -1) null else info.finished.toString() + "/" + info.total)
-            .setProgress(info.total, info.finished, false)
+            .setContentInfo(
+                if (info.total == -1 || info.finished == -1)
+                    "$progress%"
+                else
+                    "${info.finished}/${info.total} ($progress%)"
+            )
+            .setProgress(info.total, info.finished, info.total <= 0)
 
         mDownloadingDelay!!.startForeground()
     }
